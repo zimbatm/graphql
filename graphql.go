@@ -61,7 +61,6 @@ type Client struct {
 func NewClient(endpoint string, opts ...ClientOption) *Client {
 	c := &Client{
 		endpoint: endpoint,
-		Log:      func(string) {},
 	}
 	for _, optionFunc := range opts {
 		optionFunc(c)
@@ -73,7 +72,9 @@ func NewClient(endpoint string, opts ...ClientOption) *Client {
 }
 
 func (c *Client) logf(format string, args ...interface{}) {
-	c.Log(fmt.Sprintf(format, args...))
+	if c.Log != nil {
+		c.Log(fmt.Sprintf(format, args...))
+	}
 }
 
 // Run executes the query and unmarshals the response from the data field
@@ -99,20 +100,20 @@ func (c *Client) Run(ctx context.Context, req *Request, resp interface{}) error 
 func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}) error {
 	var requestBody bytes.Buffer
 	requestBodyObj := struct {
-		Query     string                 `json:"query"`
-		Variables map[string]interface{} `json:"variables"`
+		Query         string                 `json:"query"`
+		Variables     map[string]interface{} `json:"variables"`
+		OperationName string                 `json:"operationName,omitempty"`
 	}{
-		Query:     req.q,
-		Variables: req.vars,
+		Query:         req.q,
+		Variables:     req.vars,
+		OperationName: req.operationName,
 	}
 	if err := json.NewEncoder(&requestBody).Encode(requestBodyObj); err != nil {
 		return errors.Wrap(err, "encode body")
 	}
 	c.logf(">> variables: %v", req.vars)
 	c.logf(">> query: %s", req.q)
-	gr := &graphResponse{
-		Data: resp,
-	}
+
 	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
 	if err != nil {
 		return err
@@ -126,28 +127,7 @@ func (c *Client) runWithJSON(ctx context.Context, req *Request, resp interface{}
 		}
 	}
 	c.logf(">> headers: %v", r.Header)
-	r = r.WithContext(ctx)
-	res, err := c.httpClient.Do(r)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, res.Body); err != nil {
-		return errors.Wrap(err, "reading body")
-	}
-	c.logf("<< %s", buf.String())
-	if err := json.NewDecoder(&buf).Decode(&gr); err != nil {
-		if res.StatusCode != http.StatusOK {
-			return fmt.Errorf("graphql: server returned a non-200 status code: %v", res.StatusCode)
-		}
-		return errors.Wrap(err, "decoding response")
-	}
-	if len(gr.Errors) > 0 {
-		// return first error
-		return gr.Errors[0]
-	}
-	return nil
+	return c.doHTTP(ctx, r, resp)
 }
 
 func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp interface{}) error {
@@ -181,9 +161,7 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 	c.logf(">> variables: %s", variablesBuf.String())
 	c.logf(">> files: %d", len(req.files))
 	c.logf(">> query: %s", req.q)
-	gr := &graphResponse{
-		Data: resp,
-	}
+
 	r, err := http.NewRequest(http.MethodPost, c.endpoint, &requestBody)
 	if err != nil {
 		return err
@@ -197,17 +175,26 @@ func (c *Client) runWithPostFields(ctx context.Context, req *Request, resp inter
 		}
 	}
 	c.logf(">> headers: %v", r.Header)
+	return c.doHTTP(ctx, r, resp)
+}
+
+func (c *Client) doHTTP(ctx context.Context, r *http.Request, resp interface{}) error {
 	r = r.WithContext(ctx)
 	res, err := c.httpClient.Do(r)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
+
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, res.Body); err != nil {
 		return errors.Wrap(err, "reading body")
 	}
 	c.logf("<< %s", buf.String())
+
+	gr := graphResponse{
+		Data: resp,
+	}
 	if err := json.NewDecoder(&buf).Decode(&gr); err != nil {
 		if res.StatusCode != http.StatusOK {
 			return fmt.Errorf("graphql: server returned a non-200 status code: %v", res.StatusCode)
@@ -250,7 +237,7 @@ func ImmediatelyCloseReqBody() ClientOption {
 type ClientOption func(*Client)
 
 type graphErr struct {
-	Message string
+	Message string `json:"message"`
 }
 
 func (e graphErr) Error() string {
@@ -258,15 +245,16 @@ func (e graphErr) Error() string {
 }
 
 type graphResponse struct {
-	Data   interface{}
-	Errors []graphErr
+	Data   interface{} `json:"data"`
+	Errors []graphErr  `json:"errors"`
 }
 
 // Request is a GraphQL request.
 type Request struct {
-	q     string
-	vars  map[string]interface{}
-	files []File
+	q             string
+	vars          map[string]interface{}
+	files         []File
+	operationName string
 
 	// Header represent any request headers that will be set
 	// when the request is made.
@@ -280,6 +268,10 @@ func NewRequest(q string) *Request {
 		Header: make(map[string][]string),
 	}
 	return req
+}
+
+func (req *Request) OperationName(name string) {
+	req.operationName = name
 }
 
 // Var sets a variable.
